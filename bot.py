@@ -336,7 +336,7 @@ async def on_message(message: discord.Message):
         else:
             save_data(data)
     else:
-        save_data(data)
+        pass  # cooldown non écoulé, aucune modification
 
     await bot.process_commands(message)
 
@@ -375,6 +375,8 @@ async def check_loans_loop():
     data = load_data()
     now = time.time()
     for uid, udata in data.items():
+        if not isinstance(udata, dict) or "coins" not in udata:
+            continue
         if udata.get("loan_amount", 0) > 0 and udata.get("loan_due", 0) < now:
             penalty = int(udata["loan_amount"] * 1.5)
             udata["coins"] = max(0, udata["coins"] - penalty)
@@ -389,6 +391,8 @@ async def check_invest_loop():
     data = load_data()
     now = time.time()
     for uid, udata in data.items():
+        if not isinstance(udata, dict) or "coins" not in udata:
+            continue
         if udata.get("invest_amount", 0) > 0 and udata.get("invest_due", 0) <= now:
             amt = udata["invest_amount"]
             mult = random.uniform(-0.30, 0.80)
@@ -598,7 +602,7 @@ async def solde(ctx):
 @bot.command(name="classement", aliases=["top", "leaderboard"])
 async def classement(ctx):
     data = load_data()
-    scores = [(int(uid), d["xp"], compute_level(d["xp"])) for uid, d in data.items()]
+    scores = [(int(uid), d["xp"], compute_level(d["xp"])) for uid, d in data.items() if isinstance(d, dict) and "xp" in d]
     scores.sort(key=lambda x: x[1], reverse=True)
     medals = ["🥇","🥈","🥉"] + ["🏅"]*7
     lines = []
@@ -617,7 +621,7 @@ async def classement(ctx):
 @bot.command(name="richesse")
 async def richesse(ctx):
     data = load_data()
-    scores = [(int(uid), d["coins"] + d.get("bank", 0)) for uid, d in data.items()]
+    scores = [(int(uid), d["coins"] + d.get("bank", 0)) for uid, d in data.items() if isinstance(d, dict) and "coins" in d]
     scores.sort(key=lambda x: x[1], reverse=True)
     medals = ["🥇","🥈","🥉"] + ["🏅"]*7
     lines = []
@@ -642,6 +646,8 @@ async def palmares(ctx):
     best_games = (0, "—")
 
     for uid, udata in data.items():
+        if not isinstance(udata, dict) or "coins" not in udata:
+            continue
         member = ctx.guild.get_member(int(uid))
         name = member.display_name if member else f"User#{uid}"
         if udata.get("streak_daily", 0) > best_streak[0]:
@@ -1783,6 +1789,7 @@ async def poker(ctx, mise: str = "0"):
         return await ctx.send(embed=discord.Embed(description="❌ Pas assez de coins.", color=COLOR_RED))
 
     user["total_games_played"] = user.get("total_games_played", 0) + 1
+    user["coins"] -= bet  # Déduire la mise dès le début
 
     suits_list = ["♠","♥","♦","♣"]
     ranks_list = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
@@ -1842,8 +1849,8 @@ async def poker(ctx, mise: str = "0"):
     hand_name, mult = poker_hand_name(new_hand)
 
     if mult > 0:
-        gain = bet * mult
-        user["coins"] += gain
+        gain = bet * mult  # gain net (la mise a déjà été déduite)
+        user["coins"] += bet + gain  # on rend la mise + le gain
         user["casino_wins"] += 1
         user["total_earned"] = user.get("total_earned", 0) + gain
         if gain > user.get("best_jackpot", 0):
@@ -1852,7 +1859,7 @@ async def poker(ctx, mise: str = "0"):
         color = COLOR_GREEN
         result_txt = f"+**{gain:,}** 🪙  (x{mult})"
     else:
-        user["coins"] = max(0, user["coins"] - bet)
+        # mise déjà déduite, rien à faire
         user["casino_losses"] += 1
         add_history(user, "🃏 Poker rien", -bet)
         color = COLOR_RED
@@ -1867,7 +1874,7 @@ async def poker(ctx, mise: str = "0"):
 
 # ─── DUEL POKER (nouveau) ─────────────────────────────────────────────────────
 
-@bot.command(name="duel_poker", aliases=["duelpokser", "pokervspoker"])
+@bot.command(name="duel_poker", aliases=["duelpoker", "pokervspoker"])
 async def duel_poker(ctx, target: discord.Member, mise: str = "0"):
     """Duel de poker — meilleure main gagne."""
     if target.bot or target.id == ctx.author.id:
@@ -1905,10 +1912,8 @@ async def duel_poker(ctx, target: discord.Member, mise: str = "0"):
     hand1 = [deck.pop() for _ in range(5)]
     hand2 = [deck.pop() for _ in range(5)]
 
-    _, mult1 = poker_hand_name(hand1)
-    name1, _ = poker_hand_name(hand1)
-    _, mult2 = poker_hand_name(hand2)
-    name2, _ = poker_hand_name(hand2)
+    name1, mult1 = poker_hand_name(hand1)
+    name2, mult2 = poker_hand_name(hand2)
 
     result = discord.Embed(title="🃏  Résultat Duel Poker", color=COLOR_CASINO)
     result.add_field(name=f"🧑 {ctx.author.display_name}  —  {name1}", value=render_hand(hand1), inline=False)
@@ -2222,6 +2227,7 @@ async def mines(ctx, mise: str = "0", cases: int = 3):
         return await ctx.send(embed=discord.Embed(description="❌ Pas assez de coins.", color=COLOR_RED))
     cases = max(1, min(8, cases))
     user["total_games_played"] = user.get("total_games_played", 0) + 1
+    user["coins"] -= bet  # Déduire la mise dès le début
     total = 9
     mine_positions = random.sample(range(total), cases)
     revealed = []
@@ -2284,7 +2290,7 @@ async def mines(ctx, mise: str = "0", cases: int = 3):
         revealed.append(idx)
 
         if idx in mine_positions:
-            user["coins"] = max(0, user["coins"] - bet)
+            # mise déjà déduite au départ, rien à retrancher
             user["casino_losses"] += 1
             for m_idx in mine_positions:
                 if m_idx not in revealed:
@@ -2299,9 +2305,10 @@ async def mines(ctx, mise: str = "0", cases: int = 3):
         mult = round(1 + (len(revealed) / safe) * (cases * 0.85), 2)
         await ctx.send(embed=make_mines_embed())
 
+    # Cashout : la mise a déjà été déduite, on rend mise × mult
     win = int(bet * mult)
-    gain = win - bet
-    user["coins"] += gain
+    gain = win - bet  # profit net
+    user["coins"] += win  # on restitue la mise + le gain
     if gain >= 0:
         user["casino_wins"] += 1
         user["total_earned"] = user.get("total_earned", 0) + gain
