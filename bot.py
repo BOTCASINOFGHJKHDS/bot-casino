@@ -142,20 +142,21 @@ def save_data(data: dict):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-def save_user_data(data: dict, *user_ids: int):
-    """Recharge les données actuelles depuis le disque et ne fusionne que les
-    utilisateurs concernés par cette commande, avant de sauvegarder.
-
-    Corrige un bug de concurrence : sans ça, une commande longue (blackjack,
-    crash, mines, duel...) qui attend une réponse pendant plusieurs secondes
-    pouvait écraser les changements d'autres joueurs faits entretemps par
-    d'autres commandes, car elle sauvegardait un instantané périmé de tout
-    le fichier de données."""
+def commit_user(user_id: int, user: dict):
+    """Recharge les données les plus récentes du disque et n'y fusionne QUE
+    l'utilisateur concerné, avant de sauvegarder. Indispensable pour les
+    commandes qui attendent une réponse (hit/stand, pari, etc.) : sans ça,
+    un %daily ou une autre partie jouée par un autre membre pendant
+    l'attente serait écrasée par la sauvegarde finale de cette commande."""
     fresh = load_data()
-    for uid in user_ids:
-        key = str(uid)
-        if key in data:
-            fresh[key] = data[key]
+    fresh[str(user_id)] = user
+    save_data(fresh)
+
+def commit_users(pairs):
+    """Comme commit_user mais pour plusieurs joueurs à la fois (duels, vols, dons...)."""
+    fresh = load_data()
+    for uid, u in pairs:
+        fresh[str(uid)] = u
     save_data(fresh)
 
 def get_user(data: dict, user_id: int) -> dict:
@@ -275,54 +276,6 @@ CASINO_CHANNEL_ID = int(os.environ.get("CASINO_CHANNEL_ID", "0"))
 reaction_message_id: int | None = None
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
-
-# ─── Anti double-jeu ──────────────────────────────────────────────────────────
-busy_users: set[int] = set()
-
-class BusyGuard:
-    """Context manager asynchrone qui verrouille un ou plusieurs joueurs
-    pendant la durée d'un jeu interactif, pour empecher les doubles-jeux."""
-    def __init__(self, ctx, *user_ids: int):
-        self.ctx = ctx
-        self.ids = user_ids
-        self.ok = False
-
-    async def __aenter__(self):
-        for uid in self.ids:
-            if uid in busy_users:
-                await self.ctx.send(embed=discord.Embed(
-                    description="⏳ Une partie est déjà en cours pour un des joueurs concernés — termine-la d'abord !",
-                    color=COLOR_RED
-                ))
-                self.ok = False
-                return self
-        for uid in self.ids:
-            busy_users.add(uid)
-        self.ok = True
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if self.ok:
-            for uid in self.ids:
-                busy_users.discard(uid)
-        return False
-
-# ─── Branding visuel global ───────────────────────────────────────────────────
-_skip_branding = False
-_RawEmbed = discord.Embed
-
-class BrandedEmbed(_RawEmbed):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if _skip_branding:
-            return
-        if self.timestamp is None:
-            self.timestamp = datetime.now()
-        if (not self.footer) or (not self.footer.text):
-            icon = bot.user.display_avatar.url if bot.user else None
-            self.set_footer(text="🎰 CasinoBot", icon_url=icon)
-
-discord.Embed = BrandedEmbed
 
 vocal_sessions: dict[int, float] = {}
 
@@ -1314,17 +1267,6 @@ async def coinflip(ctx, mise: str = "0", choix: str = "pile"):
 
 @bot.command(name="blackjack", aliases=["bj"])
 async def blackjack(ctx, mise: str = "0"):
-    async with BusyGuard(ctx, ctx.author.id) as g:
-        if not g.ok:
-            return
-        global _skip_branding
-        _skip_branding = True
-        try:
-            await _blackjack_impl(ctx, mise)
-        finally:
-            _skip_branding = False
-
-async def _blackjack_impl(ctx, mise: str = "0"):
     data = load_data()
     user = get_user(data, ctx.author.id)
     bet = parse_bet(user, mise)
@@ -1399,7 +1341,7 @@ async def _blackjack_impl(ctx, mise: str = "0"):
             user["coins"] = max(0, user["coins"] - bet)
             user["casino_losses"] += 1
             add_history(user, "🃏 Blackjack bust", -bet)
-            save_user_data(data, ctx.author.id)
+            commit_user(ctx.author.id, user)
             e = make_embed(False)
             e.color = COLOR_RED
             e.title = "🃏  Bust !"
@@ -1429,7 +1371,7 @@ async def _blackjack_impl(ctx, mise: str = "0"):
         e.color = COLOR_RED
         e.add_field(name="❌ Défaite", value=f"-**{bet:,}** 🪙", inline=True)
     e.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
-    save_user_data(data, ctx.author.id)
+    commit_user(ctx.author.id, user)
     await ctx.send(embed=e)
 
 @bot.command(name="roulette")
@@ -1524,12 +1466,6 @@ async def dice(ctx, mise: str = "0"):
 
 @bot.command(name="crash")
 async def crash(ctx, mise: str = "0"):
-    async with BusyGuard(ctx, ctx.author.id) as g:
-        if not g.ok:
-            return
-        await _crash_impl(ctx, mise)
-
-async def _crash_impl(ctx, mise: str = "0"):
     """Jeu de crash : le multiplicateur monte, cashout avant le crash !"""
     data = load_data()
     user = get_user(data, ctx.author.id)
@@ -1652,7 +1588,7 @@ async def _crash_impl(ctx, mise: str = "0"):
         user["casino_losses"] += 1
         result_embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
 
-    save_user_data(data, ctx.author.id)
+    commit_user(ctx.author.id, user)
     await msg.edit(embed=result_embed)
 
 # ─── PLINKO (nouveau) ─────────────────────────────────────────────────────────
@@ -1723,12 +1659,6 @@ async def plinko(ctx, mise: str = "0"):
 
 @bot.command(name="highlow", aliases=["hl"])
 async def highlow(ctx, mise: str = "0"):
-    async with BusyGuard(ctx, ctx.author.id) as g:
-        if not g.ok:
-            return
-        await _highlow_impl(ctx, mise)
-
-async def _highlow_impl(ctx, mise: str = "0"):
     """Devine si la prochaine carte est plus haute ou plus basse."""
     data = load_data()
     user = get_user(data, ctx.author.id)
@@ -1806,7 +1736,7 @@ async def _highlow_impl(ctx, mise: str = "0"):
             user["coins"] = max(0, user["coins"] - bet)
             user["casino_losses"] += 1
             add_history(user, "🃏 HighLow perdu", -bet)
-            save_user_data(data, ctx.author.id)
+            save_data(data)
             return await ctx.send(embed=discord.Embed(
                 title="❌  Perdu !",
                 description=f"La carte était **{next_card}**.\nPerte de **{bet:,}** 🪙.",
@@ -1819,7 +1749,7 @@ async def _highlow_impl(ctx, mise: str = "0"):
     user["casino_wins"] += 1
     user["total_earned"] = user.get("total_earned", 0) + gain
     add_history(user, f"🃏 HighLow x{mult:.2f}", gain)
-    save_user_data(data, ctx.author.id)
+    save_data(data)
     embed = discord.Embed(title="💸  Cashout HighLow !", color=COLOR_GREEN)
     embed.add_field(name="📊 Mult final", value=f"**x{mult:.2f}**", inline=True)
     embed.add_field(name="💰 Gains", value=f"+**{gain:,}** 🪙", inline=True)
@@ -1866,12 +1796,6 @@ def poker_hand_name(hand: list[str]) -> tuple[str, int]:
 
 @bot.command(name="poker")
 async def poker(ctx, mise: str = "0"):
-    async with BusyGuard(ctx, ctx.author.id) as g:
-        if not g.ok:
-            return
-        await _poker_impl(ctx, mise)
-
-async def _poker_impl(ctx, mise: str = "0"):
     """Video Poker — 5 cartes, garde celles que tu veux, une relance."""
     data = load_data()
     user = get_user(data, ctx.author.id)
@@ -1883,6 +1807,7 @@ async def _poker_impl(ctx, mise: str = "0"):
 
     user["total_games_played"] = user.get("total_games_played", 0) + 1
     user["coins"] -= bet  # Déduire la mise dès le début
+    commit_user(ctx.author.id, user)  # persistée immédiatement (évite de miser 2x la même mise)
 
     suits_list = ["♠","♥","♦","♣"]
     ranks_list = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
@@ -1958,7 +1883,7 @@ async def _poker_impl(ctx, mise: str = "0"):
         color = COLOR_RED
         result_txt = f"-**{bet:,}** 🪙"
 
-    save_user_data(data, ctx.author.id)
+    commit_user(ctx.author.id, user)
     result = discord.Embed(title=f"🃏  Video Poker — {hand_name}", color=color)
     result.add_field(name="🂠 Main finale", value=render_hand(new_hand), inline=False)
     result.add_field(name="🏆 Résultat", value=result_txt, inline=True)
@@ -1969,15 +1894,9 @@ async def _poker_impl(ctx, mise: str = "0"):
 
 @bot.command(name="duel_poker", aliases=["duelpoker", "pokervspoker"])
 async def duel_poker(ctx, target: discord.Member, mise: str = "0"):
+    """Duel de poker — meilleure main gagne."""
     if target.bot or target.id == ctx.author.id:
         return await ctx.send(embed=discord.Embed(description="❌ Cible invalide.", color=COLOR_RED))
-    async with BusyGuard(ctx, ctx.author.id, target.id) as g:
-        if not g.ok:
-            return
-        await _duel_poker_impl(ctx, target, mise)
-
-async def _duel_poker_impl(ctx, target: discord.Member, mise: str = "0"):
-    """Duel de poker — meilleure main gagne."""
     data = load_data()
     challenger = get_user(data, ctx.author.id)
     opponent = get_user(data, target.id)
@@ -2018,34 +1937,23 @@ async def _duel_poker_impl(ctx, target: discord.Member, mise: str = "0"):
     result.add_field(name=f"🧑 {ctx.author.display_name}  —  {name1}", value=render_hand(hand1), inline=False)
     result.add_field(name=f"🧑 {target.display_name}  —  {name2}", value=render_hand(hand2), inline=False)
 
-    challenger["total_games_played"] = challenger.get("total_games_played", 0) + 1
-    opponent["total_games_played"] = opponent.get("total_games_played", 0) + 1
-
     if mult1 > mult2:
         challenger["coins"] += bet
         opponent["coins"] = max(0, opponent["coins"] - bet)
         challenger["casino_wins"] += 1
-        opponent["casino_losses"] = opponent.get("casino_losses", 0) + 1
-        challenger["total_earned"] = challenger.get("total_earned", 0) + bet
-        add_history(challenger, f"🃏 Duel Poker gagné vs {target.display_name}", bet)
-        add_history(opponent, f"🃏 Duel Poker perdu vs {ctx.author.display_name}", -bet)
         result.color = COLOR_GREEN
         result.add_field(name="🏆 Vainqueur !", value=f"{ctx.author.mention} remporte **{bet:,}** 🪙 !", inline=False)
     elif mult2 > mult1:
         opponent["coins"] += bet
         challenger["coins"] = max(0, challenger["coins"] - bet)
         opponent["casino_wins"] += 1
-        challenger["casino_losses"] = challenger.get("casino_losses", 0) + 1
-        opponent["total_earned"] = opponent.get("total_earned", 0) + bet
-        add_history(opponent, f"🃏 Duel Poker gagné vs {ctx.author.display_name}", bet)
-        add_history(challenger, f"🃏 Duel Poker perdu vs {target.display_name}", -bet)
         result.color = COLOR_RED
         result.add_field(name="🏆 Vainqueur !", value=f"{target.mention} remporte **{bet:,}** 🪙 !", inline=False)
     else:
         result.color = COLOR_BLUE
         result.add_field(name="🤝 Égalité !", value="Mises remboursées.", inline=False)
 
-    save_user_data(data, ctx.author.id, target.id)
+    commit_users([(ctx.author.id, challenger), (target.id, opponent)])
     await ctx.send(embed=result)
 
 # ─── Mini-jeux ────────────────────────────────────────────────────────────────
@@ -2211,12 +2119,6 @@ async def quiz(ctx, category: str = ""):
 async def rps(ctx, target: discord.Member, mise: str = "0"):
     if target.bot or target.id == ctx.author.id:
         return await ctx.send(embed=discord.Embed(description="❌ Cible invalide.", color=COLOR_RED))
-    async with BusyGuard(ctx, ctx.author.id, target.id) as g:
-        if not g.ok:
-            return
-        await _rps_impl(ctx, target, mise)
-
-async def _rps_impl(ctx, target: discord.Member, mise: str = "0"):
     data = load_data()
     challenger = get_user(data, ctx.author.id)
     opponent = get_user(data, target.id)
@@ -2271,42 +2173,25 @@ async def _rps_impl(ctx, target: discord.Member, mise: str = "0"):
     result_embed.add_field(name="VS", value="⚔️", inline=True)
     result_embed.add_field(name=target.display_name, value=e2, inline=True)
 
-    challenger["total_games_played"] = challenger.get("total_games_played", 0) + 1
-    opponent["total_games_played"] = opponent.get("total_games_played", 0) + 1
-
     if c1n == c2n:
         result_embed.add_field(name="🤝 Résultat", value="Égalité ! Mise remboursée.", inline=False)
     elif wins_map[c1n] == c2n:
         challenger["coins"] += bet; opponent["coins"] = max(0, opponent["coins"] - bet)
         challenger["casino_wins"] += 1
-        opponent["casino_losses"] = opponent.get("casino_losses", 0) + 1
-        challenger["total_earned"] = challenger.get("total_earned", 0) + bet
-        add_history(challenger, f"✊ RPS gagné vs {target.display_name}", bet)
-        add_history(opponent, f"✊ RPS perdu vs {ctx.author.display_name}", -bet)
         result_embed.color = COLOR_GREEN
         result_embed.add_field(name="🏆 Victoire !", value=f"{ctx.author.mention} gagne **{bet:,}** 🪙 !", inline=False)
     else:
         opponent["coins"] += bet; challenger["coins"] = max(0, challenger["coins"] - bet)
         opponent["casino_wins"] += 1
-        challenger["casino_losses"] = challenger.get("casino_losses", 0) + 1
-        opponent["total_earned"] = opponent.get("total_earned", 0) + bet
-        add_history(opponent, f"✊ RPS gagné vs {ctx.author.display_name}", bet)
-        add_history(challenger, f"✊ RPS perdu vs {target.display_name}", -bet)
         result_embed.color = COLOR_RED
         result_embed.add_field(name="🏆 Victoire !", value=f"{target.mention} gagne **{bet:,}** 🪙 !", inline=False)
-    save_user_data(data, ctx.author.id, target.id)
+    commit_users([(ctx.author.id, challenger), (target.id, opponent)])
     await ctx.send(embed=result_embed)
 
 @bot.command(name="duel")
 async def duel(ctx, target: discord.Member, mise: str = "0"):
     if target.bot or target.id == ctx.author.id:
         return await ctx.send(embed=discord.Embed(description="❌ Cible invalide.", color=COLOR_RED))
-    async with BusyGuard(ctx, ctx.author.id, target.id) as g:
-        if not g.ok:
-            return
-        await _duel_impl(ctx, target, mise)
-
-async def _duel_impl(ctx, target: discord.Member, mise: str = "0"):
     data = load_data()
     challenger = get_user(data, ctx.author.id)
     opponent = get_user(data, target.id)
@@ -2338,38 +2223,19 @@ async def _duel_impl(ctx, target: discord.Member, mise: str = "0"):
     result_embed.add_field(name="VS", value="⚡", inline=True)
     result_embed.add_field(name=target.display_name, value=f"🎲 **{r2}**", inline=True)
 
-    challenger["total_games_played"] = challenger.get("total_games_played", 0) + 1
-    opponent["total_games_played"] = opponent.get("total_games_played", 0) + 1
-
     if r1 > r2:
         challenger["coins"] += bet; opponent["coins"] = max(0, opponent["coins"] - bet)
-        challenger["casino_wins"] = challenger.get("casino_wins", 0) + 1
-        opponent["casino_losses"] = opponent.get("casino_losses", 0) + 1
-        challenger["total_earned"] = challenger.get("total_earned", 0) + bet
-        add_history(challenger, f"⚔️ Duel gagné vs {target.display_name}", bet)
-        add_history(opponent, f"⚔️ Duel perdu vs {ctx.author.display_name}", -bet)
         result_embed.color = COLOR_GREEN
         result_embed.add_field(name="🏆 Vainqueur !", value=f"{ctx.author.mention} remporte **{bet:,}** 🪙 !", inline=False)
     else:
         opponent["coins"] += bet; challenger["coins"] = max(0, challenger["coins"] - bet)
-        opponent["casino_wins"] = opponent.get("casino_wins", 0) + 1
-        challenger["casino_losses"] = challenger.get("casino_losses", 0) + 1
-        opponent["total_earned"] = opponent.get("total_earned", 0) + bet
-        add_history(opponent, f"⚔️ Duel gagné vs {ctx.author.display_name}", bet)
-        add_history(challenger, f"⚔️ Duel perdu vs {target.display_name}", -bet)
         result_embed.color = COLOR_RED
         result_embed.add_field(name="🏆 Vainqueur !", value=f"{target.mention} remporte **{bet:,}** 🪙 !", inline=False)
-    save_user_data(data, ctx.author.id, target.id)
+    save_data(data)
     await ctx.send(embed=result_embed)
 
 @bot.command(name="mines")
 async def mines(ctx, mise: str = "0", cases: int = 3):
-    async with BusyGuard(ctx, ctx.author.id) as g:
-        if not g.ok:
-            return
-        await _mines_impl(ctx, mise, cases)
-
-async def _mines_impl(ctx, mise: str = "0", cases: int = 3):
     data = load_data()
     user = get_user(data, ctx.author.id)
     bet = parse_bet(user, mise)
@@ -2448,7 +2314,7 @@ async def _mines_impl(ctx, mise: str = "0", cases: int = 3):
                 if m_idx not in revealed:
                     revealed.append(m_idx)
             add_history(user, "💣 Mines — boom !", -bet)
-            save_user_data(data, ctx.author.id)
+            save_data(data)
             e = make_mines_embed("lose")
             e.add_field(name="💥 MINE !", value=f"Perdu **{bet:,}** 🪙", inline=False)
             return await ctx.send(embed=e)
@@ -2465,7 +2331,7 @@ async def _mines_impl(ctx, mise: str = "0", cases: int = 3):
         user["casino_wins"] += 1
         user["total_earned"] = user.get("total_earned", 0) + gain
         add_history(user, f"💣 Mines cashout x{mult:.2f}", gain)
-    save_user_data(data, ctx.author.id)
+    save_data(data)
     e = make_mines_embed("win")
     e.add_field(name="💸 Encaissé !", value=f"x{mult:.2f} → **+{gain:,}** 🪙", inline=False)
     await ctx.send(embed=e)
@@ -2805,15 +2671,6 @@ async def shop(ctx):
 async def buy(ctx, item_key: str = ""):
     if item_key not in SHOP_ITEMS:
         return await ctx.send(embed=discord.Embed(description="❌ Item invalide. Utilise `%shop` pour voir les items.", color=COLOR_RED))
-    if item_key == "role_perso":
-        async with BusyGuard(ctx, ctx.author.id) as g:
-            if not g.ok:
-                return
-            await _buy_impl(ctx, item_key)
-    else:
-        await _buy_impl(ctx, item_key)
-
-async def _buy_impl(ctx, item_key: str = ""):
     item = SHOP_ITEMS[item_key]
     data = load_data()
     user = get_user(data, ctx.author.id)
@@ -2848,7 +2705,7 @@ async def _buy_impl(ctx, item_key: str = ""):
             role = await ctx.guild.create_role(name=rn.content.strip()[:50], color=color, reason=f"Shop — {ctx.author}")
             await ctx.author.add_roles(role)
             user["coins"] -= item["price"]
-            save_user_data(data, ctx.author.id)
+            save_data(data)
             embed = discord.Embed(title="✅  Rôle créé !", description=f"Le rôle **{role.name}** a été créé et attribué !", color=color)
             await ctx.send(embed=embed)
         except discord.Forbidden:
@@ -2857,7 +2714,7 @@ async def _buy_impl(ctx, item_key: str = ""):
         user["coins"] -= item["price"]
         user["inventory"].append(item_key)
         add_history(user, f"🛒 Achat: {item['name']}", -item["price"])
-        save_user_data(data, ctx.author.id)
+        save_data(data)
         embed = discord.Embed(
             title="✅  Achat réussi !",
             description=f"Tu as acheté **{item['name']}** !",
